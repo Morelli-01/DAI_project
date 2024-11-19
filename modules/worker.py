@@ -3,16 +3,22 @@ import threading
 import time
 from base64 import encode
 from multiprocessing import Value
+from multiprocessing.pool import worker
+from platform import release
 from time import sleep
-
+import json
 import numpy as np
+import paho.mqtt.client as mqtt
+import uuid
+
+WELL_KNOWN = '/.well-known'
 
 
 def extract_token(decoded_data):
     return int(decoded_data[decoded_data.find('{') + 1: decoded_data.find('}')])
 
 
-class Worker(threading.Thread):
+class Worker():
     def __init__(self, host="localhost", port=None, debug=False, next_host=("", None), shared_var=None):
         super().__init__()
         self.host = host
@@ -29,6 +35,7 @@ class Worker(threading.Thread):
         self.hook_func = lambda: None
         if self.debug_:
             print("Socket is ready!")
+        self.stop_ = False
 
     def assign_work(self, row: np.ndarray, cols: np.ndarray, proc_index, hook_func=lambda: None):
         self.row = row
@@ -102,3 +109,89 @@ class Worker(threading.Thread):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as send_socket:
             send_socket.connect(self.next_host)
             send_socket.sendall(f"Token {{{token_value}}} from {self.name}".encode())
+
+
+class MqttWorker(threading.Thread):
+
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        if self.debug_:
+            print(f"{self.id} has connected with result code {reason_code}")
+
+    def on_message(self, client, userdata, msg):
+        if self.debug_:
+            print(self.id + ": " + msg.topic + " " + str(msg.payload))
+
+        if msg.topic == WELL_KNOWN:
+            decoded_msg = json.loads(msg.payload.decode())
+            self.workers_['ids'] = decoded_msg['ids']
+
+        if msg.topic == f"/{self.id}/request":
+            ...
+        if msg.topic == f"/{self.id}/response":
+            ...
+
+    def stop(self):
+        self.stop_ = True
+
+    def __init__(self, id=None, broker_host='localhost', broker_port=1883, debug=False, shared_var=None):
+        super().__init__()
+        if id == None:
+            self.id = str(uuid.uuid4())
+        else:
+            self.id = str(id)
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.shared_var = shared_var
+        self.debug_ = debug
+        self.client_ = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.id)
+        self.client_.on_connect = self.on_connect
+        self.client_.on_message = self.on_message
+        self.client_.connect(host=self.broker_host, port=self.broker_port, keepalive=6000)
+        self.stop_ = False
+        self.workers_ = {'ids': []}
+        msg = {'id': self.id}
+        self.client_.publish(topic=WELL_KNOWN + '/add', payload=json.dumps(msg).encode())
+        self.client_.subscribe(topic='/' + self.id + '/#', qos=2)
+
+    def assign_work(self, row: np.ndarray, cols: np.ndarray, proc_index):
+        self.row = row
+        self.cols = cols.T
+        self.proc_index = proc_index
+        self.work_done = False
+
+    def lamport_access(self):
+        self.client_.subscribe(WELL_KNOWN, qos=2)
+        while self.workers_['ids'].__len__() == 0:
+            self.client_.loop_read()
+            self.client_.loop_write()
+        self.client_.unsubscribe(WELL_KNOWN)
+
+        request_msg = {
+            'id': self.id
+        }
+        for w in self.workers_['ids']:
+            self.client_.publish(topic=f"/{w}/request", payload=json.dumps(request_msg).encode())
+
+    def run(self):
+        i = 0
+        result = np.zeros((self.cols.shape[0]))
+        result_available = False
+        while not self.stop_:
+
+            if i < result.shape[0]:
+                result[i] = (self.row * self.cols[i]).sum()
+                i += 1
+
+                if i == result.shape[0]:
+                    if self.debug_:
+                        print(f"{self.id}: The matmul prod is ready")
+                    result_available = True
+
+            if result_available:
+                self.lamport_access()
+                result_available = False
+
+            self.client_.loop_read()
+            self.client_.loop_write()
+
+        self.client_.disconnect()

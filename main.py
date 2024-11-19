@@ -1,13 +1,15 @@
 from numpy import ndarray
-
-from modules.worker import Worker
+from paho.mqtt.client import Client
+import paho.mqtt.client as mqtt
+from modules.worker import Worker, MqttWorker
 from random import randint
 from multiprocessing import shared_memory, cpu_count
 import numpy as np
-import time
+import time, json
 from prettytable import PrettyTable
 
-N_PROCESSES = 16
+WELL_KNOWN = '/.well-known'
+N_PROCESSES = 4
 DEBUG = False
 
 
@@ -40,7 +42,8 @@ class Ring_Mutex():
                 next_worker = self.workers[len(self.workers) - 1]
                 next_worker = (next_worker.host, next_worker.port)
 
-            w = Worker(host=host, port=casual_port, next_host=next_worker, debug=self.debug, shared_var=self.shared_matrix)
+            w = Worker(host=host, port=casual_port, next_host=next_worker, debug=self.debug,
+                       shared_var=self.shared_matrix)
             self.workers.append(w)
 
         next_worker = self.workers[len(self.workers) - 1]
@@ -52,10 +55,10 @@ class Ring_Mutex():
     def start(self):
         start = time.time()
         for i in range(1, len(self.workers)):
-            self.workers[i].assign_work(mat1[i], mat2, i)
+            self.workers[i].assign_work(self.m1[i], self.m2, i)
             self.workers[i].start()
 
-        self.workers[0].assign_work(mat1[0], mat2, 0)
+        self.workers[0].assign_work(self.m1[0], self.m2, 0)
         self.workers[0].starter(N_PROCESSES)
 
         for w in self.workers:
@@ -71,23 +74,73 @@ class Ring_Mutex():
         print(t)
 
 
+class Lamport_Mutex():
+    def __init__(self, m1: ndarray, m2: ndarray, debug=False):
+        self.N_PROCESSES = m1.shape[0]
+        self.m1 = m1
+        self.m2 = m2
+        self.out_mat = np.zeros((m1.shape[0], m2.shape[1]))
+        self.shmem_ = shared_memory.SharedMemory(create=True, size=self.out_mat.nbytes)
+        self.shared_matrix = np.ndarray(self.out_mat.shape, dtype=self.out_mat.dtype, buffer=self.shmem_.buf)
+        self.shared_matrix[:] = self.out_mat
+        self.workers = []
+        self.debug = debug
+
+        while len(self.workers) < self.N_PROCESSES:
+            w_ = MqttWorker(debug=True, shared_var=self.shared_matrix)
+            self.workers.append(w_)
+
+        if self.debug:
+            print(f"{len(self.workers)} processes have been created")
+
+    def start(self):
+        for i in range(len(self.workers)):
+            self.workers[i].assign_work(self.m1[i], self.m2, i)
+            self.workers[i].start()
+
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    print(f"master thread has connected with result code {reason_code}")
+
+
+def on_message(client, userdata, msg):
+    decoded_msg = json.loads(msg.payload.decode())
+    if msg.retain:
+        print(decoded_msg)
+        workers['ids'] = decoded_msg['ids']
+
+    if msg.topic == WELL_KNOWN + '/add':
+        workers['ids'].append(decoded_msg["id"])
+        client.publish(topic=WELL_KNOWN, payload=json.dumps(workers).encode(), retain=True)
+
 
 if __name__ == "__main__":
+    mat1 = np.random.randint(1, 11, (N_PROCESSES, 20))
+    mat2 = np.random.randint(1, 11, (20, 2000))
+    #
+    # rm_ = Ring_Mutex(mat1, mat2, debug=DEBUG)
+    # rm_.start()
+    #
+    # start = time.time()
+    # res_mat = mat1.dot(mat2)
+    # end = time.time()
+    # length = end - start
+    # t = PrettyTable(['Name', 'Value'])
+    # t.add_row(['Processes', 1])
+    # t.add_row(['Elapsed Time(s)', length])
+    # print(t)
+    # # print(shared_matrix)
+    # if (res_mat == rm_.shared_matrix).all():
+    #     print(f"The Shared_matrix contains the correct result")
 
-    mat1 = np.random.randint(1, 11, (N_PROCESSES, 20000))
-    mat2 = np.random.randint(1, 11, (20000, 2000))
+    global workers
+    workers = {'ids': []}
+    master_proc = Client(mqtt.CallbackAPIVersion.VERSION2, client_id='Master')
+    master_proc.on_connect = on_connect
+    master_proc.on_message = on_message
+    master_proc.connect(host='localhost', port=1883, keepalive=6000)
+    master_proc.subscribe(topic=WELL_KNOWN + '/#', qos=2)
+    master_proc.loop_start()
 
-    rm_ = Ring_Mutex(mat1, mat2, debug=DEBUG)
-    rm_.start()
-
-    start = time.time()
-    res_mat = mat1.dot(mat2)
-    end = time.time()
-    length = end - start
-    t = PrettyTable(['Name', 'Value'])
-    t.add_row(['Processes', 1])
-    t.add_row(['Elapsed Time(s)', length])
-    print(t)
-    # print(shared_matrix)
-    if (res_mat == rm_.shared_matrix).all():
-        print(f"The Shared_matrix contains the correct result")
+    lm_ = Lamport_Mutex(mat1, mat2, True)
+    lm_.start()
