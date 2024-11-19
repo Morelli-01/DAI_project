@@ -1,10 +1,7 @@
 import socket
 import threading
 import time
-from base64 import encode
 from multiprocessing import Value
-from multiprocessing.pool import worker
-from platform import release
 from time import sleep
 import json
 import numpy as np
@@ -118,6 +115,7 @@ class MqttWorker(threading.Thread):
             print(f"{self.id} has connected with result code {reason_code}")
 
     def on_message(self, client, userdata, msg):
+        decoded_msg = json.loads(msg.payload.decode())
         if self.debug_:
             print(self.id + ": " + msg.topic + " " + str(msg.payload))
 
@@ -126,9 +124,17 @@ class MqttWorker(threading.Thread):
             self.workers_['ids'] = decoded_msg['ids']
 
         if msg.topic == f"/{self.id}/request":
-            ...
+            self.critical_queue_[float(decoded_msg['timestamp'])] = decoded_msg['id']
+            self.client_.publish(topic=f"/{decoded_msg['id']}/response", payload=json.dumps({'id': self.id}).encode())
+            print(f"{self.id}: send response to {decoded_msg['id']}")
+
         if msg.topic == f"/{self.id}/response":
-            ...
+            if not self.confirmation_ids_.__contains__(decoded_msg['id']):
+                self.confirmation_ids_.append(decoded_msg['id'])
+                print(f"{self.id}: received response from {decoded_msg['id']}")
+
+        if msg.topic == f"/{self.id}/release":
+            self.critical_queue_.pop(float(decoded_msg['timestamp']))
 
     def stop(self):
         self.stop_ = True
@@ -149,6 +155,12 @@ class MqttWorker(threading.Thread):
         self.client_.connect(host=self.broker_host, port=self.broker_port, keepalive=6000)
         self.stop_ = False
         self.workers_ = {'ids': []}
+        self.critical_queue_ = {}
+        self.n_confirmation_ = 0
+        self.confirmation_ids_ = []
+        self.got_access_ = False
+        self.work_done = False
+
         msg = {'id': self.id}
         self.client_.publish(topic=WELL_KNOWN + '/add', payload=json.dumps(msg).encode())
         self.client_.subscribe(topic='/' + self.id + '/#', qos=2)
@@ -159,7 +171,7 @@ class MqttWorker(threading.Thread):
         self.proc_index = proc_index
         self.work_done = False
 
-    def lamport_access(self):
+    def lamport_access(self, result):
         self.client_.subscribe(WELL_KNOWN, qos=2)
         while self.workers_['ids'].__len__() == 0:
             self.client_.loop_read()
@@ -167,13 +179,34 @@ class MqttWorker(threading.Thread):
         self.client_.unsubscribe(WELL_KNOWN)
 
         request_msg = {
-            'id': self.id
+            'id': self.id,
+            'timestamp': str(time.time())
         }
+        self.critical_queue_[float(request_msg['timestamp'])] = request_msg['id']
         for w in self.workers_['ids']:
+            if w == self.id:
+                continue
             self.client_.publish(topic=f"/{w}/request", payload=json.dumps(request_msg).encode())
+        print(f"{self.id}: critical section access requested with tm-{request_msg['timestamp']}")
+        # self.client_.loop_start()
+        # sleep(5)
+        # self.client_.loop_stop()
+
+        while self.confirmation_ids_.__len__() != (self.workers_['ids'].__len__() - 1) or \
+                list(self.critical_queue_.values())[0] != self.id:
+            self.client_.loop_read()
+            self.client_.loop_write()
+
+        # do teh job
+        self.shared_var[self.proc_index] = result
+        print(f"{self.id}: got access to critical section")
+
+        for w in self.workers_['ids']:
+            self.client_.publish(topic=f"/{w}/release", payload=json.dumps(request_msg).encode())
 
     def run(self):
         i = 0
+        self.stop_ = False
         result = np.zeros((self.cols.shape[0]))
         result_available = False
         while not self.stop_:
@@ -183,15 +216,17 @@ class MqttWorker(threading.Thread):
                 i += 1
 
                 if i == result.shape[0]:
-                    if self.debug_:
-                        print(f"{self.id}: The matmul prod is ready")
+                    print(f"{self.id}: The matmul prod is ready")
                     result_available = True
 
             if result_available:
-                self.lamport_access()
+                self.lamport_access(result)
                 result_available = False
+                # msg = {'id': self.id}
+                # self.client_.publish(topic=WELL_KNOWN + '/remove', payload=json.dumps(msg).encode())
+                self.stop_ = True
 
             self.client_.loop_read()
             self.client_.loop_write()
 
-        self.client_.disconnect()
+        self.client_.loop_start()

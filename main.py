@@ -86,9 +86,11 @@ class Lamport_Mutex():
         self.workers = []
         self.debug = debug
 
+        i = 0
         while len(self.workers) < self.N_PROCESSES:
-            w_ = MqttWorker(debug=True, shared_var=self.shared_matrix)
+            w_ = MqttWorker(debug=debug, shared_var=self.shared_matrix, id=f"Thread-{i}")
             self.workers.append(w_)
+            i += 1
 
         if self.debug:
             print(f"{len(self.workers)} processes have been created")
@@ -98,9 +100,8 @@ class Lamport_Mutex():
             self.workers[i].assign_work(self.m1[i], self.m2, i)
             self.workers[i].start()
 
-
-def on_connect(client, userdata, flags, reason_code, properties):
-    print(f"master thread has connected with result code {reason_code}")
+        for w in self.workers:
+            w.join()
 
 
 def on_message(client, userdata, msg):
@@ -113,6 +114,11 @@ def on_message(client, userdata, msg):
         workers['ids'].append(decoded_msg["id"])
         client.publish(topic=WELL_KNOWN, payload=json.dumps(workers).encode(), retain=True)
 
+    if msg.topic == WELL_KNOWN + '/remove':
+        idx = workers['ids'].index(decoded_msg["id"])
+        workers['ids'].pop(idx)
+        client.publish(topic=WELL_KNOWN, payload=json.dumps(workers).encode(), retain=True)
+
 
 if __name__ == "__main__":
     mat1 = np.random.randint(1, 11, (N_PROCESSES, 20))
@@ -122,7 +128,7 @@ if __name__ == "__main__":
     # rm_.start()
     #
     # start = time.time()
-    # res_mat = mat1.dot(mat2)
+    res_mat = mat1.dot(mat2)
     # end = time.time()
     # length = end - start
     # t = PrettyTable(['Name', 'Value'])
@@ -136,11 +142,12 @@ if __name__ == "__main__":
     global workers
     workers = {'ids': []}
     master_proc = Client(mqtt.CallbackAPIVersion.VERSION2, client_id='Master')
-    master_proc.on_connect = on_connect
     master_proc.on_message = on_message
     master_proc.connect(host='localhost', port=1883, keepalive=6000)
     master_proc.subscribe(topic=WELL_KNOWN + '/#', qos=2)
     master_proc.loop_start()
 
-    lm_ = Lamport_Mutex(mat1, mat2, True)
+    lm_ = Lamport_Mutex(mat1, mat2, False)
     lm_.start()
+    if (res_mat == lm_.shared_matrix).all():
+        print(f"The Shared_matrix contains the correct result")
