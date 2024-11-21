@@ -1,7 +1,7 @@
 from numpy import ndarray
 from paho.mqtt.client import Client
 import paho.mqtt.client as mqtt
-from modules.worker import Worker, MqttWorker
+from modules.worker import RingWorker, MqttWorker, MqttDeviceDiscovery
 from random import randint
 from multiprocessing import shared_memory, cpu_count
 import numpy as np
@@ -9,7 +9,7 @@ import time, json
 from prettytable import PrettyTable
 
 WELL_KNOWN = '/.well-known'
-N_PROCESSES = 4
+N_PROCESSES = 2
 DEBUG = False
 
 
@@ -42,8 +42,8 @@ class Ring_Mutex():
                 next_worker = self.workers[len(self.workers) - 1]
                 next_worker = (next_worker.host, next_worker.port)
 
-            w = Worker(host=host, port=casual_port, next_host=next_worker, debug=self.debug,
-                       shared_var=self.shared_matrix)
+            w = RingWorker(host=host, port=casual_port, next_host=next_worker, debug=False,
+                           shared_var=self.shared_matrix)
             self.workers.append(w)
 
         next_worker = self.workers[len(self.workers) - 1]
@@ -73,6 +73,10 @@ class Ring_Mutex():
         t.add_row(['Token passages', self.workers[0].cycles_counter * N_PROCESSES])
         print(t)
 
+        if self.debug:
+            for w in self.workers:
+                print(w.event_history)
+
 
 class Lamport_Mutex():
     def __init__(self, m1: ndarray, m2: ndarray, debug=False):
@@ -86,9 +90,12 @@ class Lamport_Mutex():
         self.workers = []
         self.debug = debug
 
+        self.device_dicovery = MqttDeviceDiscovery(id_client='device-dicovery', debug=DEBUG)
+        self.device_dicovery.start()
+
         i = 0
         while len(self.workers) < self.N_PROCESSES:
-            w_ = MqttWorker(debug=debug, shared_var=self.shared_matrix, id=f"Thread-{i}")
+            w_ = MqttWorker(debug=DEBUG, shared_var=self.shared_matrix, id_client=f"Thread-{i}")
             self.workers.append(w_)
             i += 1
 
@@ -103,51 +110,31 @@ class Lamport_Mutex():
         for w in self.workers:
             w.join()
 
-
-def on_message(client, userdata, msg):
-    decoded_msg = json.loads(msg.payload.decode())
-    if msg.retain:
-        print(decoded_msg)
-        workers['ids'] = decoded_msg['ids']
-
-    if msg.topic == WELL_KNOWN + '/add':
-        workers['ids'].append(decoded_msg["id"])
-        client.publish(topic=WELL_KNOWN, payload=json.dumps(workers).encode(), retain=True)
-
-    if msg.topic == WELL_KNOWN + '/remove':
-        idx = workers['ids'].index(decoded_msg["id"])
-        workers['ids'].pop(idx)
-        client.publish(topic=WELL_KNOWN, payload=json.dumps(workers).encode(), retain=True)
+        if self.debug:
+            for w in self.workers:
+                print(w.event_history)
 
 
 if __name__ == "__main__":
     mat1 = np.random.randint(1, 11, (N_PROCESSES, 20))
     mat2 = np.random.randint(1, 11, (20, 2000))
-    #
+
     # rm_ = Ring_Mutex(mat1, mat2, debug=DEBUG)
     # rm_.start()
     #
-    # start = time.time()
+    start = time.time()
     res_mat = mat1.dot(mat2)
-    # end = time.time()
-    # length = end - start
-    # t = PrettyTable(['Name', 'Value'])
-    # t.add_row(['Processes', 1])
-    # t.add_row(['Elapsed Time(s)', length])
+    end = time.time()
+    length = end - start
+    t = PrettyTable(['Name', 'Value'])
+    t.add_row(['Processes', 1])
+    t.add_row(['Elapsed Time(s)', length])
     # print(t)
-    # # print(shared_matrix)
+    # print(shared_matrix)
     # if (res_mat == rm_.shared_matrix).all():
     #     print(f"The Shared_matrix contains the correct result")
 
-    global workers
-    workers = {'ids': []}
-    master_proc = Client(mqtt.CallbackAPIVersion.VERSION2, client_id='Master')
-    master_proc.on_message = on_message
-    master_proc.connect(host='localhost', port=1883, keepalive=6000)
-    master_proc.subscribe(topic=WELL_KNOWN + '/#', qos=2)
-    master_proc.loop_start()
-
-    lm_ = Lamport_Mutex(mat1, mat2, False)
+    lm_ = Lamport_Mutex(mat1, mat2, True)
     lm_.start()
     if (res_mat == lm_.shared_matrix).all():
         print(f"The Shared_matrix contains the correct result")
