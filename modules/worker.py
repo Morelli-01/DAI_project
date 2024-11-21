@@ -153,7 +153,7 @@ class MqttWorker(threading.Thread, BaseWorker):
 
     def on_message(self, client, userdata, msg):
         decoded_msg = json.loads(msg.payload.decode())
-        self.log_event(self.id_client + ": " + msg.topic + " " + str(msg.payload))
+        self.log_event(self.id_client + " [received msg]: " + msg.topic + " " + str(msg.payload))
 
         if msg.topic == WELL_KNOWN and msg.retain:
             self.workers_['ids'] = decoded_msg['ids']
@@ -162,15 +162,20 @@ class MqttWorker(threading.Thread, BaseWorker):
             self.critical_queue_[float(decoded_msg['timestamp'])] = decoded_msg['id']
             self.client_.publish(topic=f"/{decoded_msg['id']}/response",
                                  payload=json.dumps({'id': self.id_client}).encode())
-            print(f"{self.id_client}: sended response to {decoded_msg['id']}")
+            self.log_event(f"{self.id_client}: sended response to {decoded_msg['id']}")
 
         if msg.topic == f"/{self.id_client}/response":
             if not self.confirmation_ids_.__contains__(decoded_msg['id']):
                 self.confirmation_ids_.append(decoded_msg['id'])
-                print(f"{self.id_client}: received response from {decoded_msg['id']}")
+                self.log_event(f"{self.id_client}: received response from {decoded_msg['id']}")
 
         if msg.topic == f"/{self.id_client}/release":
             self.critical_queue_.pop(float(decoded_msg['timestamp']))
+
+    def del_device(self):
+        msg = {'id': self.id_client}
+        self.client_.publish(topic=REMOVE_DEVICE_TOPIC, payload=json.dumps(msg).encode())
+        self.log_event("Removed from service-dicovery")
 
     def lamport_access(self, result):
         self.client_.subscribe(WELL_KNOWN, qos=2)
@@ -205,9 +210,11 @@ class MqttWorker(threading.Thread, BaseWorker):
             self.client_.publish(topic=f"/{id}/release", payload=json.dumps(request_msg).encode())
         self.log_event(f"{self.id_client}: released critical section")
 
+    def stop(self):
+        self.client_.disconnect()
+
     def run(self):
         i = 0
-        self.stop_ = False
         result = np.zeros((self.cols.shape[0]))
         result_available = False
         while not self.work_done:

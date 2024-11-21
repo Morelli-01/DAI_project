@@ -7,9 +7,11 @@ from multiprocessing import shared_memory, cpu_count
 import numpy as np
 import time, json
 from prettytable import PrettyTable
+from time import sleep
 
 WELL_KNOWN = '/.well-known'
-N_PROCESSES = 2
+N_PROCESSES = 16
+COLUMNS = 400
 DEBUG = False
 
 
@@ -67,6 +69,7 @@ class Ring_Mutex():
         end = time.time()
         length = end - start
         t = PrettyTable(['Name', 'Value'])
+        t.add_row(['Algoritm', "Ring"])
         t.add_row(['Processes', N_PROCESSES])
         t.add_row(['Elapsed Time(s)', length])
         t.add_row(['Ring Full Cycles', self.workers[0].cycles_counter])
@@ -103,38 +106,55 @@ class Lamport_Mutex():
             print(f"{len(self.workers)} processes have been created")
 
     def start(self):
+        start = time.time()
+
         for i in range(len(self.workers)):
             self.workers[i].assign_work(self.m1[i], self.m2, i)
             self.workers[i].start()
 
         for w in self.workers:
-            w.join()
+            while not w.work_done:
+                continue
+
+        end = time.time()
+        length = end - start
+        t = PrettyTable(['Name', 'Value'])
+        t.add_row(['Algoritm', "Lamport"])
+        t.add_row(['Processes', N_PROCESSES])
+        t.add_row(['Elapsed Time(s)', length])
+        print(t)
+
+        for w in self.workers:
+            w.del_device()
+            w.stop()
 
         if self.debug:
             for w in self.workers:
                 print(w.event_history)
+                w.del_device()
 
 
 if __name__ == "__main__":
-    mat1 = np.random.randint(1, 11, (N_PROCESSES, 20))
-    mat2 = np.random.randint(1, 11, (20, 2000))
+    mat1 = np.random.randint(1, 11, (N_PROCESSES, COLUMNS))
+    mat2 = np.random.randint(1, 11, (COLUMNS, 2000))
 
-    # rm_ = Ring_Mutex(mat1, mat2, debug=DEBUG)
-    # rm_.start()
-    #
+    rm_ = Ring_Mutex(mat1, mat2, debug=True)
+    rm_.start()
+
     start = time.time()
     res_mat = mat1.dot(mat2)
     end = time.time()
     length = end - start
     t = PrettyTable(['Name', 'Value'])
+    t.add_row(['Algoritm', "np.matmul"])
     t.add_row(['Processes', 1])
     t.add_row(['Elapsed Time(s)', length])
-    # print(t)
-    # print(shared_matrix)
-    # if (res_mat == rm_.shared_matrix).all():
-    #     print(f"The Shared_matrix contains the correct result")
+    print(t)
+    if (res_mat == rm_.shared_matrix).all():
+        print(f"The RingMutex Shared_matrix contains the correct result")
 
     lm_ = Lamport_Mutex(mat1, mat2, True)
+    sleep(1)
     lm_.start()
     if (res_mat == lm_.shared_matrix).all():
-        print(f"The Shared_matrix contains the correct result")
+        print(f"The LamportMutex Shared_matrix contains the correct result")
