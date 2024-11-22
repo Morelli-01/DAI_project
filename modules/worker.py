@@ -8,6 +8,7 @@ import numpy as np
 import paho.mqtt.client as mqtt
 import uuid
 from datetime import datetime
+from sortedcontainers import SortedDict
 
 WELL_KNOWN = '/.well-known'
 ADD_DEVICE_TOPIC = WELL_KNOWN + '/add'
@@ -139,7 +140,7 @@ class MqttWorker(threading.Thread, BaseWorker):
         self.client_.on_message = self.on_message
         self.client_.connect(host=self.host, port=self.port, keepalive=6000)
         self.workers_ = {'ids': []}
-        self.critical_queue_ = {}
+        self.critical_queue_ = SortedDict()
         self.n_confirmation_ = 0
         self.confirmation_ids_ = []
         self.work_done = False
@@ -167,7 +168,7 @@ class MqttWorker(threading.Thread, BaseWorker):
         if msg.topic == f"/{self.id_client}/response":
             if not self.confirmation_ids_.__contains__(decoded_msg['id']):
                 self.confirmation_ids_.append(decoded_msg['id'])
-                self.log_event(f"{self.id_client}: received response from {decoded_msg['id']}")
+                # self.log_event(f"{self.id_client}: received response from {decoded_msg['id']}")
 
         if msg.topic == f"/{self.id_client}/release":
             self.critical_queue_.pop(float(decoded_msg['timestamp']))
@@ -194,6 +195,7 @@ class MqttWorker(threading.Thread, BaseWorker):
                 continue
             self.client_.publish(topic=f"/{id}/request", payload=json.dumps(request_msg).encode())
         self.log_event(f"{self.id_client}: critical section access requested with tm-{request_msg['timestamp']}")
+        # sleep(2)
 
         while self.confirmation_ids_.__len__() != (self.workers_['ids'].__len__() - 1) or \
                 list(self.critical_queue_.values())[0] != self.id_client:
@@ -201,8 +203,9 @@ class MqttWorker(threading.Thread, BaseWorker):
             self.client_.loop_write()
 
         # do teh job
+        self.log_event(f"{self.id_client}: got access to critical section({datetime.now().timestamp()})")
+        # sleep(5)
         self.shared_var[self.proc_index] = result
-        self.log_event(f"{self.id_client}: got access to critical section")
 
         for id in self.workers_['ids']:
             if id == self.id_client:

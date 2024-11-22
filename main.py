@@ -8,6 +8,8 @@ import numpy as np
 import time, json
 from prettytable import PrettyTable
 from time import sleep
+from datetime import datetime
+from sortedcontainers import SortedDict
 
 WELL_KNOWN = '/.well-known'
 N_PROCESSES = 16
@@ -128,18 +130,37 @@ class Lamport_Mutex():
             w.del_device()
             w.stop()
 
+        request_history = SortedDict()
+        access_history = SortedDict()
         if self.debug:
             for w in self.workers:
                 print(w.event_history)
+
+                for m in w.event_history:
+                    if m.__contains__("critical section access requested"):
+                        request_history[float(m[m.find('tm-') + 4:])] = f"[{m[m.find('[') + 1:m.find(']')]}]{m[16:m.find("crit") - 2]}"
+                    if m.__contains__("got access to critical section"):
+                        t = float(m[m.find('(') + 1:m.find(')')])
+                        access_history[t] = f"[{m[m.find('[') + 1:m.find(']')]}]{m[16:m.find("got") - 2]}"
                 w.del_device()
+
+        # for i in range(len(request_history)):
+        #     m = request_history[i]
+        #     t = datetime.fromtimestamp(float(m[m.find('tm-')+4:]), tz=None)
+        #     request_history[i] = f"[{t.time()}]{m[16:24]}"
+
+        print("Request History")
+        print(json.dumps(request_history, sort_keys=True, indent=4))
+        print("Access History")
+        print(json.dumps(access_history, sort_keys=True, indent=4))
 
 
 if __name__ == "__main__":
     mat1 = np.random.randint(1, 11, (N_PROCESSES, COLUMNS))
     mat2 = np.random.randint(1, 11, (COLUMNS, 2000))
 
-    rm_ = Ring_Mutex(mat1, mat2, debug=True)
-    rm_.start()
+    # rm_ = Ring_Mutex(mat1, mat2, debug=True)
+    # rm_.start()
 
     start = time.time()
     res_mat = mat1.dot(mat2)
@@ -150,8 +171,8 @@ if __name__ == "__main__":
     t.add_row(['Processes', 1])
     t.add_row(['Elapsed Time(s)', length])
     print(t)
-    if (res_mat == rm_.shared_matrix).all():
-        print(f"The RingMutex Shared_matrix contains the correct result")
+    # if (res_mat == rm_.shared_matrix).all():
+    #     print(f"The RingMutex Shared_matrix contains the correct result")
 
     lm_ = Lamport_Mutex(mat1, mat2, True)
     sleep(1)
