@@ -11,10 +11,11 @@ from time import sleep
 from datetime import datetime
 from sortedcontainers import SortedDict
 
-WELL_KNOWN = '/.well-known'
 N_PROCESSES = 16
 COLUMNS = 400
-DEBUG = False
+GENERAL_DEBUG = False
+LM_DEBUG = False
+RM_DEBUG = False
 
 
 class Ring_Mutex():
@@ -82,7 +83,6 @@ class Ring_Mutex():
             for w in self.workers:
                 print(w.event_history)
 
-
 class Lamport_Mutex():
     def __init__(self, m1: ndarray, m2: ndarray, debug=False):
         self.N_PROCESSES = m1.shape[0]
@@ -95,12 +95,12 @@ class Lamport_Mutex():
         self.workers = []
         self.debug = debug
 
-        self.device_dicovery = MqttDeviceDiscovery(id_client='device-dicovery', debug=DEBUG)
+        self.device_dicovery = MqttDeviceDiscovery(id_client='device-dicovery', debug=GENERAL_DEBUG)
         self.device_dicovery.start()
 
         i = 0
         while len(self.workers) < self.N_PROCESSES:
-            w_ = MqttWorker(debug=DEBUG, shared_var=self.shared_matrix, id_client=f"Thread-{i}")
+            w_ = MqttWorker(debug=GENERAL_DEBUG, shared_var=self.shared_matrix, id_client=f"Thread-{i}")
             self.workers.append(w_)
             i += 1
 
@@ -134,11 +134,13 @@ class Lamport_Mutex():
         access_history = SortedDict()
         if self.debug:
             for w in self.workers:
-                print(w.event_history)
+                if GENERAL_DEBUG:
+                    print(w.event_history)
 
                 for m in w.event_history:
                     if m.__contains__("critical section access requested"):
-                        request_history[float(m[m.find('tm-') + 4:])] = f"[{m[m.find('[') + 1:m.find(']')]}]{m[16:m.find("crit") - 2]}"
+                        request_history[float(
+                            m[m.find('tm-') + 4:])] = f"[{m[m.find('[') + 1:m.find(']')]}]{m[16:m.find("crit") - 2]}"
                     if m.__contains__("got access to critical section"):
                         t = float(m[m.find('(') + 1:m.find(')')])
                         access_history[t] = f"[{m[m.find('[') + 1:m.find(']')]}]{m[16:m.find("got") - 2]}"
@@ -148,21 +150,18 @@ class Lamport_Mutex():
         #     m = request_history[i]
         #     t = datetime.fromtimestamp(float(m[m.find('tm-')+4:]), tz=None)
         #     request_history[i] = f"[{t.time()}]{m[16:24]}"
-
-        print("Request History")
-        print(json.dumps(request_history, sort_keys=True, indent=4))
-        print("Access History")
-        print(json.dumps(access_history, sort_keys=True, indent=4))
-
+        if self.debug:
+            print("Request History")
+            print(json.dumps(request_history, sort_keys=True, indent=4))
+            print("Access History")
+            print(json.dumps(access_history, sort_keys=True, indent=4))
 
 if __name__ == "__main__":
     mat1 = np.random.randint(1, 11, (N_PROCESSES, COLUMNS))
     mat2 = np.random.randint(1, 11, (COLUMNS, 2000))
 
-    # rm_ = Ring_Mutex(mat1, mat2, debug=True)
-    # rm_.start()
-
     start = time.time()
+
     res_mat = mat1.dot(mat2)
     end = time.time()
     length = end - start
@@ -171,11 +170,12 @@ if __name__ == "__main__":
     t.add_row(['Processes', 1])
     t.add_row(['Elapsed Time(s)', length])
     print(t)
-    # if (res_mat == rm_.shared_matrix).all():
-    #     print(f"The RingMutex Shared_matrix contains the correct result")
 
-    lm_ = Lamport_Mutex(mat1, mat2, True)
+    rm_ = Ring_Mutex(mat1, mat2, debug=RM_DEBUG)
+    rm_.start()
+    assert (res_mat == rm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
+
+    lm_ = Lamport_Mutex(mat1, mat2, debug=LM_DEBUG)
     sleep(1)
     lm_.start()
-    if (res_mat == lm_.shared_matrix).all():
-        print(f"The LamportMutex Shared_matrix contains the correct result")
+    assert (res_mat == lm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
