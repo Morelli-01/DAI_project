@@ -1,3 +1,5 @@
+import socket
+import argparse, subprocess, signal
 from numpy import ndarray
 from paho.mqtt.client import Client
 import paho.mqtt.client as mqtt
@@ -11,15 +13,24 @@ from time import sleep
 from datetime import datetime
 from sortedcontainers import SortedDict
 
-N_PROCESSES = 16
-COLUMNS = 400
+N_PROCESSES = 50
+COLUMNS = 100
 GENERAL_DEBUG = False
 LM_DEBUG = False
 RM_DEBUG = False
 
 
+def is_port_free(port, host='localhost'):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, port))
+        return True
+    except OSError:
+        return False
+
+
 class Ring_Mutex():
-    def __init__(self, m1: ndarray, m2: ndarray, debug=False):
+    def __init__(self, m1: ndarray, m2: ndarray, debug=False, correct_result=None, last_port_used=3000):
         self.N_PROCESSES = m1.shape[0]
         self.m1 = m1
         self.m2 = m2
@@ -30,15 +41,17 @@ class Ring_Mutex():
         self.workers = []
         self.used_ports = []
         self.debug = debug
-
+        self.correct_result = correct_result
+        self.last_port_used = last_port_used
         self.ring_init_()
 
     def ring_init_(self):
         while len(self.workers) < self.N_PROCESSES:
-            casual_port = randint(3000, 8000)
-            while (self.used_ports.__contains__(casual_port)):
-                casual_port = randint(3000, 8000)
-            self.used_ports.append(casual_port)
+            self.last_port_used += 1
+            while not is_port_free(self.last_port_used):
+                self.last_port_used += 1
+
+            casual_port = self.last_port_used
 
             host = "localhost"
             next_worker = ("", None)
@@ -70,21 +83,41 @@ class Ring_Mutex():
             w.join()
 
         end = time.time()
-        length = end - start
+        self.elapsed_time = end - start
         t = PrettyTable(['Name', 'Value'])
         t.add_row(['Algoritm', "Ring"])
         t.add_row(['Processes', N_PROCESSES])
-        t.add_row(['Elapsed Time(s)', length])
+        t.add_row(['Elapsed Time(s)', str(self.elapsed_time)[:5]])
         t.add_row(['Ring Full Cycles', self.workers[0].cycles_counter])
         t.add_row(['Token passages', self.workers[0].cycles_counter * N_PROCESSES])
+        self.token_passed = self.workers[0].cycles_counter * N_PROCESSES
+        self.mean_access_time = 0
+        for w in self.workers:
+            self.mean_access_time += w.elapsed_t_with_token
+        self.mean_access_time /= self.workers.__len__()
+        t.add_row(['Mean Token Held Time(s)', str(self.mean_access_time)[:5]])
+
+        stddev_access_time = 0
+        for w in self.workers:
+            stddev_access_time += (w.elapsed_t_with_token - self.mean_access_time) ** 2
+        t.add_row(['Stddev Token Held Time(s)', str(stddev_access_time / self.workers.__len__())[:5]])
+
+        if self.correct_result is not None:
+            correctness = (self.correct_result == self.shared_matrix).all()
+            t.add_row(['Correct Result', correctness])
         print(t)
+
+        for w in self.workers:
+            w.s.close()
+            del w.s
 
         if self.debug:
             for w in self.workers:
                 print(w.event_history)
 
+
 class Lamport_Mutex():
-    def __init__(self, m1: ndarray, m2: ndarray, debug=False):
+    def __init__(self, m1: ndarray, m2: ndarray, debug=False, correct_result=None):
         self.N_PROCESSES = m1.shape[0]
         self.m1 = m1
         self.m2 = m2
@@ -94,6 +127,7 @@ class Lamport_Mutex():
         self.shared_matrix[:] = self.out_mat
         self.workers = []
         self.debug = debug
+        self.correct_result = correct_result
 
         self.device_dicovery = MqttDeviceDiscovery(id_client='device-dicovery', debug=GENERAL_DEBUG)
         self.device_dicovery.start()
@@ -119,17 +153,39 @@ class Lamport_Mutex():
                 continue
 
         end = time.time()
-        length = end - start
+        self.elapsed_time = end - start
         t = PrettyTable(['Name', 'Value'])
         t.add_row(['Algoritm', "Lamport"])
         t.add_row(['Processes', N_PROCESSES])
-        t.add_row(['Elapsed Time(s)', length])
+        t.add_row(['Elapsed Time(s)', str(self.elapsed_time)[:5]])
+
+        self.total_msg_sent = 0
+        self.mean_access_time = 0
+        for w in self.workers:
+            self.mean_access_time += w.elapsed_t_with_access
+            self.total_msg_sent += w.sent_msg_counter
+        self.mean_access_time /= self.workers.__len__()
+        t.add_row(['Total Msg Exchanged', str(self.total_msg_sent)[:5]])
+        t.add_row(['Mean Access Time(s)', str(self.mean_access_time)[:5]])
+
+        self.stddev_access_time = 0
+        for w in self.workers:
+            self.stddev_access_time += (w.elapsed_t_with_access - self.mean_access_time) ** 2
+        t.add_row(['Stddev Access Time(s)', str(self.stddev_access_time / self.workers.__len__())[:5]])
+
+        if self.correct_result is not None:
+            correctness = (self.correct_result == self.shared_matrix).all()
+            t.add_row(['Correct Result', correctness])
+
         print(t)
 
         for w in self.workers:
             w.del_device()
             w.stop()
+            del w
 
+        self.device_dicovery.stop()
+        del self.device_dicovery
         request_history = SortedDict()
         access_history = SortedDict()
         if self.debug:
@@ -156,7 +212,21 @@ class Lamport_Mutex():
             print("Access History")
             print(json.dumps(access_history, sort_keys=True, indent=4))
 
+
 if __name__ == "__main__":
+    last_port_used = 3000
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--n_proc', type=int, required=True)
+    parser.add_argument('--type', type=str, choices=['np', 'token-ring', 'lamport'], help="algo type", required=True)
+    parser.add_argument('--columns', type=int, help="")
+    args = parser.parse_args()
+
+    N_PROCESSES = args.n_proc
+
+    if args.columns is not None:
+        COLUMNS = int(args.columns)
+
     mat1 = np.random.randint(1, 11, (N_PROCESSES, COLUMNS))
     mat2 = np.random.randint(1, 11, (COLUMNS, 2000))
 
@@ -169,13 +239,37 @@ if __name__ == "__main__":
     t.add_row(['Algoritm', "np.matmul"])
     t.add_row(['Processes', 1])
     t.add_row(['Elapsed Time(s)', length])
-    print(t)
+    if args.type == 'np':
 
-    rm_ = Ring_Mutex(mat1, mat2, debug=RM_DEBUG)
-    rm_.start()
-    assert (res_mat == rm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
+        print(t)
 
-    lm_ = Lamport_Mutex(mat1, mat2, debug=LM_DEBUG)
-    sleep(1)
-    lm_.start()
-    assert (res_mat == lm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
+    elif args.type == 'token-ring':
+        rm_ = Ring_Mutex(mat1, mat2, debug=RM_DEBUG, last_port_used=last_port_used, correct_result=res_mat)
+        rm_.start()
+        assert (res_mat == rm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
+        last_port_used = rm_.last_port_used
+
+        # rm_.shmem_.close()
+        # del rm_.shared_matrix
+        # del rm_.shmem_
+        # del rm_
+
+    elif args.type == 'lamport':
+        mosquitto_proc = subprocess.Popen(
+            ["mosquitto", "-v", "-p", str(1883)],
+            # stdout=subprocess.PIPE,
+            # stderr=subprocess.PIPE
+        )
+        sleep(1)
+
+        lm_ = Lamport_Mutex(mat1, mat2, debug=LM_DEBUG, correct_result=res_mat)
+        sleep(2)
+        lm_.start()
+        assert (res_mat == lm_.shared_matrix).all(), f"The RingMutex Shared_matrix is not correct\n"
+        lm_.shmem_.close()
+        del lm_.shared_matrix
+        del lm_.shmem_
+        del lm_
+
+        mosquitto_proc.send_signal(signal.SIGINT)
+        mosquitto_proc.wait()

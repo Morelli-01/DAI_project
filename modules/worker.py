@@ -62,9 +62,11 @@ class RingWorker(threading.Thread, BaseWorker):
         self.log_event("Socket is ready!")
         self.stop_ = False
         self.work_done = False
+        self.elapsed_t_with_token = 0
 
     def token_passing_(self, result=None):
         try:
+            t = time.time()
             prev_conn, prev_addr = self.s.accept()
             data = prev_conn.recv(1024)
             decoded_data = data.decode()
@@ -92,6 +94,7 @@ class RingWorker(threading.Thread, BaseWorker):
                                                                                               decoded_data.find('}'):]
                 data = decoded_data.encode()
                 send_socket.sendall(data)
+                self.elapsed_t_with_token += (time.time() - t)
 
             if token_value == 0:
                 self.work_done = True
@@ -116,6 +119,8 @@ class RingWorker(threading.Thread, BaseWorker):
                 self.result_available += 1
                 self.s.setblocking(True)
 
+        del self.shared_var
+
     def stop(self):
         self._stop_event.set()
 
@@ -138,12 +143,15 @@ class MqttWorker(threading.Thread, BaseWorker):
         self.client_ = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.id_client)
         self.client_.on_connect = self.on_connect
         self.client_.on_message = self.on_message
+        self.client_.on_publish = self.on_pub
         self.client_.connect(host=self.host, port=self.port, keepalive=6000)
         self.workers_ = {'ids': []}
         self.critical_queue_ = SortedDict()
         self.n_confirmation_ = 0
         self.confirmation_ids_ = []
         self.work_done = False
+        self.elapsed_t_with_access = 0
+        self.sent_msg_counter = 0
 
         msg = {'id': self.id_client}
         self.client_.publish(topic=ADD_DEVICE_TOPIC, payload=json.dumps(msg).encode())
@@ -173,10 +181,14 @@ class MqttWorker(threading.Thread, BaseWorker):
         if msg.topic == f"/{self.id_client}/release":
             self.critical_queue_.pop(float(decoded_msg['timestamp']))
 
+    def on_pub(self, client, userdata, mid, reason_code, properties):
+        self.sent_msg_counter += 1
+
     def del_device(self):
         msg = {'id': self.id_client}
         self.client_.publish(topic=REMOVE_DEVICE_TOPIC, payload=json.dumps(msg).encode())
         self.log_event("Removed from service-dicovery")
+        del self.shared_var
 
     def lamport_access(self, result):
         self.client_.subscribe(WELL_KNOWN, qos=2)
@@ -203,10 +215,10 @@ class MqttWorker(threading.Thread, BaseWorker):
             self.client_.loop_write()
 
         # do teh job
+        t = time.time()
         self.log_event(f"{self.id_client}: got access to critical section({datetime.now().timestamp()})")
-        # sleep(5)
         self.shared_var[self.proc_index] = result
-
+        self.elapsed_t_with_access = time.time() - t
         for id in self.workers_['ids']:
             if id == self.id_client:
                 continue
